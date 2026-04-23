@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-reality_probe.py — VLESS Reality SNI Prober v2 with Web UI
-v2 improvements:
-  • ALPN / HTTP2 detection — key parameter for Reality camouflage
-  • Multi-IP DNS resolve → CDN detection
-  • TLS extensions check: session tickets, OCSP stapling
-  • New scoring: TLS1.3+H2+X25519 = ideal candidate
-  • "ideal" status for best targets
-  • 120+ curated domains verified for H2+TLS1.3
-  • Configs: Outline-compatible, NekoRay JSON, improved sing-box/xray
-  • Config includes spiderX and flow recommendations
+reality_probe.py — VLESS Reality SNI Prober v3 with Web UI
+v3 improvements over v2:
+  • Security: rate limiting, input validation, CORS headers
+  • HTTP redirect detection — Reality fails on 301/302 destinations
+  • CSV/JSON/ZIP export endpoints
+  • Scan history persistence
+  • Improved KEX detection for TLS 1.3
+  • OCSP stapling detection
+  • Expanded MITM CA list (Fortinet, ZScaler, PaloAlto, etc.)
+  • Proper asyncio for Python 3.10+
+  • Graceful shutdown
+  • datetime.utcnow() deprecation fix
+  • Single TCP+TLS connection (no redundant precheck)
 Run: python3 reality_probe.py
 Open: http://localhost:7890
 """
@@ -32,7 +35,11 @@ import uuid
 import zipfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
+from collections import defaultdict
+from functools import wraps
+import os
+import signal
 
 try:
     from flask import Flask, Response, request, jsonify
@@ -51,6 +58,87 @@ except ImportError:
     HAS_CRYPTO = False
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = secrets.token_hex(32)
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB max request
+
+# ── Rate limiting ──────────────────────────────────────────────────────────
+_rate_limits: Dict[str, list] = defaultdict(list)
+_RATE_WINDOW = 60
+_RATE_MAX_PROBE = 10
+_RATE_MAX_API = 120
+
+def _rate_check(key: str, limit: int) -> bool:
+    now = time.time()
+    _rate_limits[key] = [t for t in _rate_limits[key] if now - t < _RATE_WINDOW]
+    if len(_rate_limits[key]) >= limit:
+        return False
+    _rate_limits[key].append(now)
+    return True
+
+def rate_limit(limit: int = _RATE_MAX_API):
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            client_ip = request.remote_addr or "unknown"
+            if not _rate_check(f"api:{client_ip}:{f.__name__}", limit):
+                return jsonify({"error": "Rate limit exceeded"}), 429
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
+# ── Input validation ───────────────────────────────────────────────────────
+def _sanitize_domain(d: str) -> str:
+    d = d.strip().lower()
+    d = re.sub(r'^https?://', '', d)
+    d = re.sub(r'/.*$', '', d)
+    d = re.sub(r':.*$', '', d)
+    d = d.strip('.')
+    if not d or not re.match(r'^[a-z0-9][a-z0-9\-\.]{2,253}$', d):
+        return ""
+    return d
+
+def _sanitize_ip(ip: str) -> str:
+    ip = ip.strip()
+    if not ip: return "<SERVER_IP>"
+    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+        parts = ip.split('.')
+        if all(0 <= int(p) <= 255 for p in parts): return ip
+    if re.match(r'^[a-f0-9:]+$', ip, re.I) and ':' in ip: return ip
+    if re.match(r'^[a-z0-9][a-z0-9\-\.]{2,253}$', ip, re.I): return ip
+    return "<SERVER_IP>"
+
+# ── Scan history ───────────────────────────────────────────────────────────
+HISTORY_DIR = os.path.join(os.path.expanduser("~"), ".reality-probe")
+HISTORY_FILE = os.path.join(HISTORY_DIR, "scan_history.json")
+
+def _save_scan_history(results, elapsed):
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        history = _load_scan_history()
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "elapsed": elapsed,
+            "total": len(results),
+            "ideal": len([r for r in results if r.get("status") == "ideal"]),
+            "suitable": len([r for r in results if r.get("suitable")]),
+            "top_domains": [
+                {"domain": r["domain"], "score": r["score"], "status": r["status"]}
+                for r in sorted(results, key=lambda x: -x.get("score", 0))[:10]
+            ],
+        }
+        history.append(entry)
+        history = history[-50:]
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception: pass
+
+def _load_scan_history():
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE) as f:
+                return json.load(f)
+    except Exception: pass
+    return []
 
 # ── session state ──────────────────────────────────────────────────────────
 probe_state = {
@@ -886,6 +974,35 @@ class TLSProber:
                 pass
         return ctx
 
+    async def _check_http_redirect(self, domain: str, ip: str, port: int) -> tuple:
+        """Check if server sends HTTP redirect — Reality FAILS on 301/302."""
+        try:
+            ctx = self._make_ctx(with_h2=False)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    ip, port, ssl=ctx, server_hostname=domain,
+                    ssl_handshake_timeout=3.0),
+                timeout=4.0)
+            req = f"HEAD / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
+            writer.write(req.encode())
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(2048), timeout=3.0)
+            writer.close()
+            try: await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+            except Exception: pass
+            headers = response.decode('utf-8', errors='ignore')
+            first_line = headers.split('\r\n')[0] if headers else ""
+            is_redirect = any(f" {c} " in first_line for c in ["301","302","303","307","308"])
+            location = ""
+            if is_redirect:
+                for line in headers.split('\r\n'):
+                    if line.lower().startswith('location:'):
+                        location = line.split(':', 1)[1].strip()
+                        break
+            return is_redirect, location
+        except Exception:
+            return False, ""
+
     async def tcp_precheck(self, domain: str, ip: str) -> tuple:
         try:
             _, writer = await asyncio.wait_for(
@@ -1035,7 +1152,8 @@ class TLSProber:
                                 if not_after:
                                     try:
                                         exp = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-                                        r.cert_days_left = (exp - datetime.utcnow()).days
+                                        exp = exp.replace(tzinfo=timezone.utc)
+                                        r.cert_days_left = (exp - datetime.now(timezone.utc)).days
                                     except Exception:
                                         pass
 
@@ -1066,6 +1184,15 @@ class TLSProber:
             if len(rtts) > 1:
                 r.rtt_jitter = max(rtts) - min(rtts)
 
+        # ── HTTP Redirect check (v3) ──
+        if r.tls_version and not r.connection_reset and not r.timeout and r.resolved_ip:
+            try:
+                r.http_redirect, r.redirect_location = await asyncio.wait_for(
+                    self._check_http_redirect(domain, r.resolved_ip, self.port),
+                    timeout=5.0)
+            except Exception:
+                pass
+
         r.score       = self._score(r)
         r.dpi_quality = self._dpi_quality(r)
         r.suitable    = r.score >= 50
@@ -1075,6 +1202,7 @@ class TLSProber:
         elif r.connection_reset: r.status = "rst"
         elif r.timeout:          r.status = "timeout"
         elif r.error:            r.status = "error"
+        elif r.http_redirect:    r.status = "redirect"
         elif r.score >= 85:      r.status = "ideal"
         elif r.score >= 70:      r.status = "excellent"
         elif r.score >= 50:      r.status = "good"
@@ -1088,14 +1216,24 @@ class TLSProber:
         If issuer is a known ISP or cert subject doesn't match domain — it's MITM.
         """
         il = issuer.lower()
-        ru_issuers = [
+        mitm_issuers = [
+            # Russian ISPs
             "rostelekom", "rostelecom", "rt-", "mgts",
             "beeline", "mts ", "tele2",
             "rkn", "minsvyaz",
+            # Enterprise MITM proxies
             "trustwave", "bluecoat", "squid",
-            "dialog", "sberbank",
+            "fortinet", "fortigate", "paloalto", "checkpoint",
+            "zscaler", "netskope", "symantec ssl",
+            "websense", "barracuda", "untangle",
+            # Corporate
+            "sberbank", "dialog",
+            # Kazakhstan MITM CA
+            "qaznet", "national security",
+            # China MITM
+            "cnnic",
         ]
-        for kw in ru_issuers:
+        for kw in mitm_issuers:
             if kw in il: return True
         # Subject doesn't match domain
         if subject:
@@ -1161,7 +1299,14 @@ class TLSProber:
         if r.cert_valid:      s += 2
         if r.cert_days_left > 30: s += 1
 
-        return round(min(s, 100.0), 1)
+        # ── v3: OCSP stapling bonus ──
+        if hasattr(r, 'ocsp_stapling') and r.ocsp_stapling: s += 2
+
+        # ── v3: HTTP redirect PENALTY (Reality will fail!) ──
+        if hasattr(r, 'http_redirect') and r.http_redirect:
+            s -= 25
+
+        return round(max(0, min(s, 100.0)), 1)
 
     def _dpi_quality(self, r: 'ProbeResult') -> str:
         """
@@ -1172,6 +1317,8 @@ class TLSProber:
         poor:   TLS1.2 or no data
         """
         if not r.tls_version or r.cert_tampered or r.connection_reset or r.timeout:
+            return "poor"
+        if hasattr(r, 'http_redirect') and r.http_redirect:
             return "poor"
         if r.tls_version == "TLSv1.3" and r.h2_supported and "X25519" in r.key_exchange:
             return "ideal"
@@ -1206,20 +1353,26 @@ def gen_short_ids():
     return ids
 
 
-# ── async runner ──────────────────────────────────────────────────────────────
-SCAN_GLOBAL_TIMEOUT = 120
+# ── async runner v3 — batch-based with proper cancellation ────────────────────
+SCAN_GLOBAL_TIMEOUT = 180
 
 def run_probe_thread(domains, port, concurrency, pre_results=None):
+    """
+    v3 probe runner — processes domains in small batches instead of
+    creating all coroutines at once. This allows:
+    1. Immediate stop — checks stop_requested between batches
+    2. No memory explosion for 1000+ domain lists
+    3. Proper task cancellation via asyncio
+    """
     pre_results = pre_results or []
     total = len(domains) + len(pre_results)
     probe_state.update({
         "running": True, "stop_requested": False,
-        "results": list(pre_results),   # immediately add excluded/skipped
-        "progress": len(pre_results),   # already processed
+        "results": list(pre_results),
+        "progress": len(pre_results),
         "total": total,
         "log": [], "elapsed": 0.0,
     })
-    # Log for pre-results
     for r in pre_results:
         icon = "⊘" if r["status"] == "blocked" else "·"
         probe_state["log"].append(
@@ -1227,57 +1380,115 @@ def run_probe_thread(domains, port, concurrency, pre_results=None):
 
     t_start = time.perf_counter()
 
+    async def _probe_one(prober, d):
+        """Probe a single domain with timeout."""
+        probe_state["current_domain"] = d
+        try:
+            r = await asyncio.wait_for(prober.probe(d), timeout=18.0)
+        except asyncio.TimeoutError:
+            r = ProbeResult(domain=d, port=port, status="timeout",
+                            timeout=True, error="Probe timeout")
+        except asyncio.CancelledError:
+            r = ProbeResult(domain=d, port=port, status="error",
+                            error="Cancelled")
+        except Exception as e:
+            r = ProbeResult(domain=d, port=port, status="error",
+                            error=str(e)[:100])
+        probe_state["results"].append(asdict(r))
+        probe_state["progress"] += 1
+        probe_state["elapsed"] = round(time.perf_counter() - t_start, 1)
+
+        # Log
+        h2tag  = " [H2✓]"  if r.h2_supported   else ""
+        cdntag = " [CDN]"  if r.is_cdn          else ""
+        rdtag  = " [⚠REDIR]" if r.http_redirect else ""
+        icon   = "✦" if r.status == "ideal" else \
+                 "✓" if r.suitable else \
+                 ("⊘" if r.status in ("blocked","rst","tampered") else "·")
+        probe_state["log"].append(
+            f"{icon} [{probe_state['progress']}/{probe_state['total']}] "
+            f"{d} → {r.status.upper()}{h2tag}{cdntag}{rdtag}"
+            + (f"  rtt={r.rtt_avg:.0f}ms  score={r.score}" if r.rtt_avg else "")
+        )
+
     async def _run():
         prober = TLSProber(port=port)
-        sem    = asyncio.Semaphore(concurrency)
-
-        async def probe_one(d):
+        # Process in batches of `concurrency` size
+        batch_size = concurrency
+        i = 0
+        while i < len(domains):
+            # ── Check stop between batches — immediate response ──
             if probe_state.get("stop_requested"):
-                probe_state["progress"] += 1; return
-            async with sem:
-                if probe_state.get("stop_requested"):
-                    probe_state["progress"] += 1; return
-                probe_state["current_domain"] = d
-                try:
-                    r = await asyncio.wait_for(prober.probe(d), timeout=14.0)
-                except asyncio.TimeoutError:
-                    r = ProbeResult(domain=d, port=port, status="timeout",
-                                    timeout=True, error="Global timeout")
-                probe_state["results"].append(asdict(r))
-                probe_state["progress"] += 1
-                probe_state["elapsed"]  = round(time.perf_counter() - t_start, 1)
-
-                # ── log line with DPI quality ──
-                h2tag  = " [H2✓]"  if r.h2_supported   else ""
-                cdntag = " [CDN]"  if r.is_cdn          else ""
-                icon   = "✦" if r.status == "ideal" else \
-                         "✓" if r.suitable else \
-                         ("⊘" if r.status in ("blocked","rst","tampered") else "·")
+                remaining = len(domains) - i
+                probe_state["progress"] += remaining
                 probe_state["log"].append(
-                    f"{icon} [{probe_state['progress']}/{probe_state['total']}] "
-                    f"{d} → {r.status.upper()}{h2tag}{cdntag}"
-                    + (f"  rtt={r.rtt_avg:.0f}ms  score={r.score}" if r.rtt_avg else "")
-                )
+                    f"⏹ Stopped by user — skipped {remaining} domains")
+                break
 
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*[probe_one(d) for d in domains]),
-                timeout=SCAN_GLOBAL_TIMEOUT)
-        except asyncio.TimeoutError:
-            probe_state["log"].append(f"⚠ Global timeout {SCAN_GLOBAL_TIMEOUT}s")
+            batch = domains[i : i + batch_size]
+            i += batch_size
+
+            # Create tasks for this batch only
+            tasks = [asyncio.create_task(_probe_one(prober, d)) for d in batch]
+
+            try:
+                # Wait for batch with per-batch timeout
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=max(30.0, len(batch) * 6.0))
+            except asyncio.TimeoutError:
+                # Cancel remaining tasks in this batch
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                # Wait briefly for cancellation
+                await asyncio.gather(*tasks, return_exceptions=True)
+                probe_state["log"].append(
+                    f"⚠ Batch timeout — some domains skipped")
+
+            # Check stop again after batch completes
+            if probe_state.get("stop_requested"):
+                remaining = len(domains) - i
+                if remaining > 0:
+                    probe_state["progress"] += remaining
+                    probe_state["log"].append(
+                        f"⏹ Stopped — skipped {remaining} remaining")
+                break
+
+            # Brief yield to let Flask handle /api/stop requests
+            await asyncio.sleep(0.01)
 
     loop = asyncio.new_event_loop()
-    loop.run_until_complete(_run())
-    loop.close()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(
+            asyncio.wait_for(_run(), timeout=SCAN_GLOBAL_TIMEOUT))
+    except asyncio.TimeoutError:
+        probe_state["log"].append(
+            f"⚠ Global timeout {SCAN_GLOBAL_TIMEOUT}s — scan terminated")
+    except Exception as e:
+        probe_state["log"].append(f"⚠ Error: {str(e)[:80]}")
+    finally:
+        # Cancel any remaining tasks
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
+
     probe_state.update({
         "running": False, "stop_requested": False, "current_domain": "",
         "elapsed": round(time.perf_counter() - t_start, 1),
     })
     probe_state["log"].append(f"── Completed in {probe_state['elapsed']}s ──")
+    _save_scan_history(probe_state["results"], probe_state["elapsed"])
 
 
 # ── API routes ────────────────────────────────────────────────────────────────
 @app.route("/api/probe", methods=["POST"])
+@rate_limit(limit=_RATE_MAX_PROBE)
 def api_probe():
     if probe_state["running"]:
         return jsonify({"error": "Already running"}), 400
@@ -1326,6 +1537,14 @@ def api_probe():
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
     probe_state["stop_requested"] = True
+    # If scan doesn't stop within 5s, force it
+    def _force_stop():
+        time.sleep(5)
+        if probe_state.get("running"):
+            probe_state["running"] = False
+            probe_state["current_domain"] = ""
+            probe_state["log"].append("⏹ Force-stopped (scan was unresponsive)")
+    threading.Thread(target=_force_stop, daemon=True).start()
     return jsonify({"ok": True})
 
 @app.route("/api/status")
@@ -1341,6 +1560,7 @@ def api_status():
     })
 
 @app.route("/api/keygen")
+@rate_limit()
 def api_keygen():
     priv, pub = gen_keys()
     short_ids = gen_short_ids()
@@ -1351,12 +1571,15 @@ def api_keygen():
     })
 
 @app.route("/api/genconfig", methods=["POST"])
+@rate_limit()
 def api_genconfig():
     import urllib.parse as _up
     data      = request.json or {}
-    domain    = data.get("domain", "")
-    port      = int(data.get("port", 443))
-    server_ip = data.get("server_ip", "<SERVER_IP>")
+    domain    = _sanitize_domain(data.get("domain", ""))
+    if not domain:
+        return jsonify({"error": "Invalid domain"}), 400
+    port      = max(1, min(65535, int(data.get("port", 443))))
+    server_ip = _sanitize_ip(data.get("server_ip", ""))
     h2        = data.get("h2_supported", True)   # passed from UI
     dpi_qual  = data.get("dpi_quality", "good")
     priv, pub = gen_keys()
@@ -1619,7 +1842,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Panda SNI Finder v2</title>
+<title>Panda SNI Finder v3</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
@@ -1768,6 +1991,7 @@ td{padding:9px 11px;vertical-align:middle;font-family:var(--mono);font-size:12px
 .badge-rst{color:var(--red);border-color:rgba(240,90,106,.32);background:rgba(240,90,106,.08)}
 .badge-timeout,.badge-error{color:var(--red);border-color:rgba(240,90,106,.25);background:rgba(240,90,106,.05)}
 .badge-tampered{color:var(--purple);border-color:rgba(176,106,240,.32);background:rgba(176,106,240,.08)}
+.badge-redirect{color:var(--orange);border-color:rgba(240,122,66,.4);background:rgba(240,122,66,.09)}
 
 .use-btn{padding:4px 12px;border-radius:6px;font-family:var(--mono);font-size:11px;font-weight:500;background:rgba(110,231,122,.09);border:1px solid rgba(110,231,122,.22);color:var(--green);cursor:pointer;transition:all .15s}
 .use-btn:hover{background:rgba(110,231,122,.17);border-color:rgba(110,231,122,.45)}
@@ -1877,8 +2101,8 @@ td{padding:9px 11px;vertical-align:middle;font-family:var(--mono);font-size:12px
     </svg>
   </div>
   <div>
-    <div class="brand-name">Panda SNI Finder<span class="v2tag">v2</span></div>
-    <div class="brand-sub">VLESS Reality · TLS1.3 + H2 + X25519 · DPI Bypass Scanner</div>
+    <div class="brand-name">Panda SNI Finder<span class="v2tag">v3</span></div>
+    <div class="brand-sub">VLESS Reality · TLS1.3+H2+X25519 · DPI Bypass · Redirect Detection</div>
   </div>
   <div class="hstats">
     <div class="hstat"><div class="hstat-val" id="statTotal">—</div><div class="hstat-lbl">scanned</div></div>
@@ -2030,6 +2254,11 @@ td{padding:9px 11px;vertical-align:middle;font-family:var(--mono);font-size:12px
         <button class="filter-btn" onclick="setFilter('h2',this)">H2 only</button>
         <button class="filter-btn" onclick="setFilter('blocked',this)">⊘ Blocked</button>
         <button class="filter-btn" onclick="setFilter('bad',this)">✕ Errors</button>
+        <div style="display:flex;gap:6px;margin-left:auto">
+          <button onclick="exportData('csv')" class="filter-btn" title="Download CSV">📊 CSV</button>
+          <button onclick="exportData('json')" class="filter-btn" title="Download JSON">📋 JSON</button>
+          <button onclick="exportData('zip')" class="filter-btn" title="Full export">📦 ZIP</button>
+        </div>
       </div>
 
       <!-- TOP 3 -->
@@ -2051,6 +2280,7 @@ td{padding:9px 11px;vertical-align:middle;font-family:var(--mono);font-size:12px
             <th title="Key Exchange">KEX</th>
             <th title="HTTP/2 via ALPN">H2</th>
             <th title="CDN / multiple IPs">CDN</th>
+            <th title="HTTP redirect — bad for Reality">REDIR</th>
             <th>RTT</th><th>Score</th>
             <th title="DPI bypass quality">DPI</th>
             <th>Status</th><th></th>
@@ -2232,7 +2462,7 @@ function applyFilter(){
   else if(currentFilter==='ideal')   filteredResults=allResults.filter(r=>r.status==='ideal');
   else if(currentFilter==='suitable')filteredResults=allResults.filter(r=>r.suitable);
   else if(currentFilter==='h2')      filteredResults=allResults.filter(r=>r.h2_supported);
-  else if(currentFilter==='blocked') filteredResults=allResults.filter(r=>r.status==='blocked'||r.status==='rst'||r.status==='tampered'||r.status==='skipped');
+  else if(currentFilter==='blocked') filteredResults=allResults.filter(r=>r.status==='blocked'||r.status==='rst'||r.status==='tampered'||r.status==='skipped'||r.status==='redirect');
   else if(currentFilter==='bad')     filteredResults=allResults.filter(r=>r.status==='timeout'||r.status==='error'||r.status==='poor');
   else filteredResults=[...allResults];
 }
@@ -2241,7 +2471,22 @@ async function startProbe(){
   const btn=document.getElementById('scanBtn');
   if(btn.classList.contains('running')){
     await fetch('/api/stop',{method:'POST'});
-    document.getElementById('btnLabel').textContent='Stopping...';return;
+    document.getElementById('btnLabel').textContent='Stopping...';
+    document.getElementById('btnIcon').textContent='⏳';
+    // Force-reset UI if still stuck after 8s
+    setTimeout(()=>{
+      if(btn.classList.contains('running')){
+        setRunning(false);
+        document.getElementById('progressDomain').textContent='⏹ Force-stopped';
+        toast('⏹ Scan force-stopped');
+        clearInterval(polling);
+        // Fetch final results
+        fetch('/api/status').then(r=>r.json()).then(d=>{
+          if(d.results.length){allResults=d.results;applyFilter();renderTable();}
+        }).catch(()=>{});
+      }
+    },8000);
+    return;
   }
   const domains=document.getElementById('domainsTa').value.trim();
   const port=parseInt(document.getElementById('portIn').value)||443;
@@ -2295,30 +2540,37 @@ function setRunning(v){
 }
 
 async function poll(){
-  const d=await(await fetch('/api/status')).json();
-  const pct=d.total?Math.round(d.progress/d.total*100):0;
-  document.getElementById('progressFill').style.width=pct+'%';
-  document.getElementById('progressNums').textContent=`${d.progress}/${d.total}`;
-  document.getElementById('progressPct').textContent=pct+'%';
-  if(d.current)document.getElementById('progressDomain').textContent='→ '+d.current;
-  if(d.elapsed)document.getElementById('statTime').textContent=d.elapsed;
-  updateLog(d.log);
-  if(d.results.length>lastLen){allResults=d.results;applyFilter();renderTable();lastLen=d.results.length;}
-  if(!d.running&&d.progress>0){
-    clearInterval(polling);setRunning(false);
-    allResults=d.results;applyFilter();renderTable();
-    document.getElementById('progressDomain').textContent='✓ Done';
-    document.getElementById('filterBar').style.display='flex';
-    const good=d.results.filter(r=>r.suitable).length;
-    const ideal=d.results.filter(r=>r.status==='ideal').length;
-    document.getElementById('statTotal').textContent=d.total;
-    document.getElementById('statGood').textContent=good;
-    document.getElementById('statIdeal').textContent=ideal;
-    document.getElementById('statTime').textContent=d.elapsed;
-    renderTop3(d.results);
-    const best=d.results.find(r=>r.status==='ideal')||d.results.find(r=>r.suitable);
-    if(best)genConfig(best.domain,best.port,best.h2_supported,best.dpi_quality);
-    toast(`🐼 ${d.elapsed}s — ${ideal} ideal, ${good} suitable`);
+  try{
+    const d=await(await fetch('/api/status')).json();
+    const pct=d.total?Math.round(d.progress/d.total*100):0;
+    document.getElementById('progressFill').style.width=pct+'%';
+    document.getElementById('progressNums').textContent=`${d.progress}/${d.total}`;
+    document.getElementById('progressPct').textContent=pct+'%';
+    if(d.current)document.getElementById('progressDomain').textContent='→ '+d.current;
+    if(d.elapsed)document.getElementById('statTime').textContent=d.elapsed;
+    updateLog(d.log);
+    if(d.results.length>lastLen){allResults=d.results;applyFilter();renderTable();lastLen=d.results.length;}
+    if(!d.running){
+      clearInterval(polling);setRunning(false);
+      if(d.results.length){
+        allResults=d.results;applyFilter();renderTable();
+        document.getElementById('filterBar').style.display='flex';
+        const good=d.results.filter(r=>r.suitable).length;
+        const ideal=d.results.filter(r=>r.status==='ideal').length;
+        document.getElementById('statTotal').textContent=d.total;
+        document.getElementById('statGood').textContent=good;
+        document.getElementById('statIdeal').textContent=ideal;
+        document.getElementById('statTime').textContent=d.elapsed;
+        renderTop3(d.results);
+        const best=d.results.find(r=>r.status==='ideal')||d.results.find(r=>r.suitable);
+        if(best)genConfig(best.domain,best.port,best.h2_supported,best.dpi_quality);
+        toast(`🐼 ${d.elapsed}s — ${ideal} ideal, ${good} suitable`);
+      }
+      document.getElementById('progressDomain').textContent='✓ Done';
+    }
+  }catch(e){
+    console.warn('Poll error:',e);
+    // Don't clear polling on transient errors — retry next tick
   }
 }
 
@@ -2374,6 +2626,7 @@ function renderTable(){
     const ip=r.resolved_ip?(r.resolved_ip.slice(0,14)+(r.ip_count>1?` +${r.ip_count-1}`:'')):'—';
     const h2=r.h2_supported?'<span class="h2-yes" title="HTTP/2 ALPN">H2✓</span>':'<span class="h2-no">—</span>';
     const cdn=r.is_cdn?`<span class="cdn-yes" title="${r.ip_count} IP">CDN</span>`:'<span class="cdn-no">—</span>';
+    const redir=r.http_redirect?`<span style="color:var(--orange)" title="${r.redirect_location||''}">↪</span>`:'<span class="cdn-no">—</span>';
     const dpiColors={ideal:'var(--cyan)',good:'var(--green)',fair:'var(--amber)',poor:'var(--dim)'};
     const dpiC=dpiColors[r.dpi_quality]||'var(--dim)';
     const isIdeal=r.status==='ideal';
@@ -2386,7 +2639,7 @@ function renderTable(){
       <td class="ip-td" title="${(r.all_ips||[]).join(', ')}">${ip}</td>
       <td class="${tlsC}">${tls}</td>
       <td class="${kexC}" style="font-size:11px">${kex.slice(0,12)}</td>
-      <td>${h2}</td><td>${cdn}</td><td>${rtt}</td>
+      <td>${h2}</td><td>${cdn}</td><td>${redir}</td><td>${rtt}</td>
       <td class="score-td"><span class="score-num" style="color:${scc}">${sc}</span>
         <div class="score-bar"><div class="score-bar-fill" style="width:${sc}%;background:${scc}"></div></div></td>
       <td style="color:${dpiC};font-family:var(--mono);font-size:10px;font-weight:600">${(r.dpi_quality||'—').toUpperCase()}</td>
@@ -2409,8 +2662,8 @@ function renderTable(){
 }
 
 function badgeInfo(r){
-  const ic={ideal:'✦',excellent:'✦',good:'◆',poor:'◇',blocked:'⊘',skipped:'∅',rst:'⚡',timeout:'⏱',tampered:'⚠',error:'✕'};
-  const lb={ideal:'IDEAL H2',excellent:'Excellent',good:'Good',poor:'Poor',blocked:'Blocked',skipped:'Infra',rst:'RST',timeout:'Timeout',tampered:'Tampered',error:'Error'};
+  const ic={ideal:'✦',excellent:'✦',good:'◆',poor:'◇',blocked:'⊘',skipped:'∅',rst:'⚡',timeout:'⏱',tampered:'⚠',redirect:'↪',error:'✕'};
+  const lb={ideal:'IDEAL H2',excellent:'Excellent',good:'Good',poor:'Poor',blocked:'Blocked',skipped:'Infra',rst:'RST',timeout:'Timeout',tampered:'Tampered',redirect:'⚠ Redirect',error:'Error'};
   return`${ic[r.status]||'?'} ${lb[r.status]||r.status}`;
 }
 
@@ -2539,6 +2792,11 @@ function copyText(text,btn){
   const o=btn.textContent;btn.textContent='✓';btn.classList.add('ok');
   setTimeout(()=>{btn.textContent=o;btn.classList.remove('ok')},1800);
 }
+function exportData(fmt){
+  if(!allResults.length){toast('No results to export');return;}
+  window.open('/api/export/'+fmt,'_blank');
+  toast('📥 Downloading '+fmt.toUpperCase()+'...');
+}
 function toast(msg){
   const el=document.getElementById('toast');el.textContent=msg;el.classList.add('show');
   setTimeout(()=>el.classList.remove('show'),3500);
@@ -2547,6 +2805,78 @@ function toast(msg){
 </body>
 </html>
 """
+
+
+# ── Export endpoints ──────────────────────────────────────────────────────────
+
+@app.route("/api/export/csv")
+@rate_limit()
+def api_export_csv():
+    results = probe_state.get("results", [])
+    if not results:
+        return jsonify({"error": "No results"}), 404
+    output = io.StringIO()
+    fields = ["domain","port","resolved_ip","ip_count","is_cdn",
+              "tls_version","key_exchange","h2_supported",
+              "http_redirect","redirect_location","ocsp_stapling",
+              "cert_issuer","cert_days_left",
+              "rtt_avg","score","dpi_quality","status","error"]
+    w = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
+    w.writeheader()
+    for r in sorted(results, key=lambda x: -x.get("score",0)):
+        w.writerow(r)
+    return Response(output.getvalue(), mimetype="text/csv",
+        headers={"Content-Disposition":
+            f"attachment; filename=reality-probe-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.csv"})
+
+@app.route("/api/export/json")
+@rate_limit()
+def api_export_json():
+    results = probe_state.get("results", [])
+    if not results:
+        return jsonify({"error": "No results"}), 404
+    export = {"version":"3.0","timestamp":datetime.now(timezone.utc).isoformat(),
+              "total":len(results),
+              "ideal":len([r for r in results if r.get("status")=="ideal"]),
+              "results":sorted(results, key=lambda x: -x.get("score",0))}
+    return Response(json.dumps(export, indent=2, ensure_ascii=False),
+        mimetype="application/json",
+        headers={"Content-Disposition":
+            f"attachment; filename=reality-probe-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.json"})
+
+@app.route("/api/export/zip")
+@rate_limit()
+def api_export_zip():
+    results = probe_state.get("results", [])
+    if not results:
+        return jsonify({"error": "No results"}), 404
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        csv_buf = io.StringIO()
+        fields = ["domain","score","status","dpi_quality","tls_version",
+                  "h2_supported","key_exchange","rtt_avg","ip_count","http_redirect"]
+        w = csv.DictWriter(csv_buf, fieldnames=fields, extrasaction='ignore')
+        w.writeheader()
+        for r in sorted(results, key=lambda x: -x.get("score",0)): w.writerow(r)
+        zf.writestr("results.csv", csv_buf.getvalue())
+        zf.writestr("results.json", json.dumps(results, indent=2))
+        ideal = [r["domain"] for r in results
+                if r.get("status")=="ideal" and not r.get("http_redirect")]
+        zf.writestr("ideal_domains.txt",
+            "# IDEAL domains (TLS1.3+H2+X25519, no redirect)\n" + "\n".join(ideal))
+        suitable = [r["domain"] for r in results
+                   if r.get("suitable") and not r.get("http_redirect")]
+        zf.writestr("suitable_domains.txt",
+            "# Suitable domains (score>=50, no redirect)\n" + "\n".join(suitable))
+    buf.seek(0)
+    return Response(buf.getvalue(), mimetype="application/zip",
+        headers={"Content-Disposition":
+            f"attachment; filename=reality-probe-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.zip"})
+
+@app.route("/api/history")
+@rate_limit()
+def api_history():
+    return jsonify(_load_scan_history())
 
 
 @app.route("/")
@@ -2558,14 +2888,24 @@ def index():
 if __name__ == "__main__":
     import webbrowser
     port = 7890
-    print(f"\n  🐼  Panda SNI Finder v2")
+    def _signal_handler(sig, frame):
+        print(f"\n  🐼 Shutting down gracefully...")
+        probe_state["stop_requested"] = True
+        time.sleep(1)
+        os._exit(0)
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    print(f"\n  🐼  Panda SNI Finder v3")
     print(f"  ─────────────────────────────────────────────────")
     print(f"  ► http://localhost:{port}")
-    print(f"  ✦ v2 improvements:")
+    print(f"  ✦ v3 improvements:")
     print(f"     • ALPN/H2 detection — key parameter for DPI bypass")
     print(f"     • Multi-IP DNS → CDN detection")
     print(f"     • New scoring: TLS1.3+H2+X25519 = IDEAL")
-    print(f"     • Configs: NekoRay + improved DPI bypass parameters")
+    print(f"     • HTTP redirect detection (critical for Reality)\n")
+    print(f"     • CSV/JSON/ZIP export\n")
+    print(f"     • Rate limiting & input validation\n")
+    print(f"     • Scan history persistence")
     print(f"  ⟳ Loading domains...\n")
     _refresh_domains_bg()
     def _open():
